@@ -43,7 +43,7 @@
 
 import path   from 'path';
 import fs     from 'fs';
-import { SentinelNode, type SentinelNodeConfig } from './node-agent.js';
+import { SentinelNode, type SentinelNodeConfig } from './agent.js';
 
 /* ── Read service name from package.json if not set ────────── */
 function _detectServiceName(): string {
