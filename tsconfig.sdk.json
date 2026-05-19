@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "rootDir": "./sentinel-sdk",
+    "outDir": "./dist",
+    "module": "ESNext",
+    "target": "ES2020",
+    "declaration": true,
+    "esModuleInterop": true
+  },
+  "include": ["sentinel-sdk/**/*"]
+}
