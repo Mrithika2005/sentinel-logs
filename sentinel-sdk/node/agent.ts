@@ -1485,13 +1485,6 @@ export class SentinelNode {
   this._tryPatchMongoDB();  // ← add this line
   this._tryPatchRedis();
 }
-   
-  private _patchDatabaseDrivers(): void {
-    this._tryPatchPg();
-    this._tryPatchNeo4j();
-    this._tryPatchMongoose();
-    this._tryPatchRedis();
-  }
 
   private _tryPatchPg(): void {
     let pg: any;
@@ -1581,6 +1574,31 @@ export class SentinelNode {
     } catch (e) { if (this.cfg.debug) console.error('[SENTINEL] neo4j patch failed:', e); }
   }
 
+   
+  private _tryPatchMongoose(): void {
+    let mongoose: any;
+    try { mongoose = require('mongoose'); } catch { return; }
+    const self = this;
+    try {
+      mongoose.plugin((schema: any) => {
+        const hooks = ['save','find','findOne','findOneAndUpdate','deleteOne','deleteMany','updateOne','updateMany'];
+        hooks.forEach((hook) => {
+          schema.pre(hook,  function (this: any, next: Function) { this._sentinelStart = Date.now(); next(); });
+          schema.post(hook, function (this: any, result: any) {
+            const durationMs = Date.now() - (this._sentinelStart || Date.now());
+            const isSlow     = durationMs > self.cfg.slowQueryMs;
+            self._emit({
+              message: `Mongoose ${hook}${isSlow ? ' [SLOW]' : ''}`,
+              layer:   LogLayer.DATA_ACCESS,
+              level:   isSlow ? LogLevel.WARN : LogLevel.INFO,
+              context: { database: 'mongodb', queryType: hook.toUpperCase(), durationMs, rowCount: Array.isArray(result) ? result.length : 1, slowQuery: isSlow },
+            });
+          });
+        });
+      });
+    } catch (e) { if (this.cfg.debug) console.error('[SENTINEL] mongoose patch failed:', e); }
+  }
+
 
    private _tryPatchMongoDB(): void {
   let mongodb: any;
@@ -1639,31 +1657,6 @@ export class SentinelNode {
     return col;
   };
 }
-   
-  private _tryPatchMongoose(): void {
-    let mongoose: any;
-    try { mongoose = require('mongoose'); } catch { return; }
-    const self = this;
-    try {
-      mongoose.plugin((schema: any) => {
-        const hooks = ['save','find','findOne','findOneAndUpdate','deleteOne','deleteMany','updateOne','updateMany'];
-        hooks.forEach((hook) => {
-          schema.pre(hook,  function (this: any, next: Function) { this._sentinelStart = Date.now(); next(); });
-          schema.post(hook, function (this: any, result: any) {
-            const durationMs = Date.now() - (this._sentinelStart || Date.now());
-            const isSlow     = durationMs > self.cfg.slowQueryMs;
-            self._emit({
-              message: `Mongoose ${hook}${isSlow ? ' [SLOW]' : ''}`,
-              layer:   LogLayer.DATA_ACCESS,
-              level:   isSlow ? LogLevel.WARN : LogLevel.INFO,
-              context: { database: 'mongodb', queryType: hook.toUpperCase(), durationMs, rowCount: Array.isArray(result) ? result.length : 1, slowQuery: isSlow },
-            });
-          });
-        });
-      });
-    } catch (e) { if (this.cfg.debug) console.error('[SENTINEL] mongoose patch failed:', e); }
-  }
-
   private _tryPatchRedis(): void {
     let Redis: any;
     try { Redis = require('ioredis'); } catch { return; }
