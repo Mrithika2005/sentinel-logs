@@ -1,0 +1,6 @@
+{
+  "name": "Sentinel Universal Observer",
+  "description": "A cross-stack auto-hooking logging system that captures logs from Presentation, Gateway, Logic, and Persistence layers across Node.js, Python, and Browser environments.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
