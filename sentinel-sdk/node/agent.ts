@@ -1477,6 +1477,15 @@ export class SentinelNode {
 
   /* ── DB driver patches ────────────────────────────────────────────────── */
 
+
+   private _patchDatabaseDrivers(): void {
+  this._tryPatchPg();
+  this._tryPatchNeo4j();
+  this._tryPatchMongoose();
+  this._tryPatchMongoDB();  // ← add this line
+  this._tryPatchRedis();
+}
+   
   private _patchDatabaseDrivers(): void {
     this._tryPatchPg();
     this._tryPatchNeo4j();
@@ -1572,6 +1581,65 @@ export class SentinelNode {
     } catch (e) { if (this.cfg.debug) console.error('[SENTINEL] neo4j patch failed:', e); }
   }
 
+
+   private _tryPatchMongoDB(): void {
+  let mongodb: any;
+  try { mongodb = require('mongodb'); } catch { return; }
+  const self = this;
+
+  const origCollection = mongodb.Db.prototype.collection.bind(mongodb.Db.prototype);
+  mongodb.Db.prototype.collection = function (...args: any[]) {
+    const col = origCollection.apply(this, args);
+    const ops = ['find','findOne','insertOne','insertMany',
+                 'updateOne','updateMany','deleteOne','deleteMany',
+                 'aggregate','countDocuments','findOneAndUpdate',
+                 'findOneAndDelete'];
+    ops.forEach((op) => {
+      const orig = col[op]?.bind(col);
+      if (!orig) return;
+      col[op] = async (...a: any[]) => {
+        const start = Date.now();
+        try {
+          const result     = await orig(...a);
+          const durationMs = Date.now() - start;
+          const isSlow     = durationMs > self.cfg.slowQueryMs;
+          self._emit({
+            message: `MongoDB ${op}${isSlow ? ' [SLOW]' : ''}: ${col.collectionName}`,
+            layer:   LogLayer.DATA_ACCESS,
+            level:   isSlow ? LogLevel.WARN : LogLevel.INFO,
+            context: {
+              database:             'mongodb',
+              queryType:            op.toUpperCase(),
+              table:                col.collectionName,
+              durationMs,
+              slowQuery:            isSlow,
+              slowQueryThresholdMs: self.cfg.slowQueryMs,
+              rowCount:             Array.isArray(result) ? result.length : undefined,
+            },
+          });
+          return result;
+        } catch (err: any) {
+          self._emit({
+            message: `MongoDB ${op} error: ${err.message}`,
+            layer:   LogLayer.DATA_ACCESS,
+            level:   LogLevel.ERROR,
+            context: {
+              database:      'mongodb',
+              queryType:     op.toUpperCase(),
+              table:         col.collectionName,
+              durationMs:    Date.now() - start,
+              exceptionType: err.constructor.name,
+              stackTrace:    err.stack,
+            },
+          });
+          throw err;
+        }
+      };
+    });
+    return col;
+  };
+}
+   
   private _tryPatchMongoose(): void {
     let mongoose: any;
     try { mongoose = require('mongoose'); } catch { return; }
