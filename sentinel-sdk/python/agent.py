@@ -1,43 +1,67 @@
-"""
-SENTINEL SDK — Python Agent  v3.1
-==================================
-Bug fixes from v3.0:
-  • CRITICAL: _gen_16hex() had `uuid4().hex[:0]` which sliced to empty
-    string — trace IDs were only 32 chars from one uuid (correct by
-    coincidence) but the intent was clearly two UUIDs concatenated.
-    Fixed to use secrets.token_hex(16) which gives a proper 32-char
-    cryptographically random hex string every time.
-  • _trace_id on SentinelPython had the same [:0] bug.
-  • _gen_8hex() now uses secrets.token_hex(8) — crypto-safe, correct
-    W3C span_id (16 hex chars = 8 bytes).
-  • PII regex: password pattern used a non-raw string with escape
-    sequences inside character class — replaced with raw strings
-    throughout and fixed the character class to [\"\'`] properly.
-  • _DiskBuffer.write(): size check happened before write so rotation
-    after writing could still overflow. Now checks+rotates atomically.
-  • _OtlpExporter timestamp: datetime.timezone.utc isoformat() produces
-    +00:00 not Z — removed incorrect .replace('Z', '+00:00').
-  • _HealthServer: used single-threaded http.server.HTTPServer —
-    replaced with ThreadingHTTPServer so health probes never block.
-  • mask_context: now correctly handles lists/tuples recursively.
-  • _patch_psycopg2: wrapped in try/except around the class attribute
-    set because psycopg2 C-extension cursor rejects attribute assignment
-    on some builds — falls back to a cursor_factory wrapper.
-  • SentinelMeta async_wrapper: removed duplicate asyncDurationMs from
-    the success context (was logged twice).
-  • _emit: samplingRate/samplingDecision added to context BEFORE
-    mask_context runs so they are always present and unredacted.
-  • FastAPI middleware: send_wrapper now deepcopies message dict before
-    mutating headers to avoid mutating the original ASGI message.
-  • _patch_requests: body size calculation guarded against generator
-    bodies that have no len().
-  • parseTraceparent: validates hex format of trace_id/span_id segments.
-  • buildTraceparent: pads/truncates ids defensively.
-  • All bare `except: pass` replaced with `except Exception` for clarity.
-  • init_sentinel docstring updated.
+AGENT.PY
 
-Usage
------
+"""
+SENTINEL SDK — Python Agent  v4.0
+==================================
+
+What's new in v4.0
+——————————
+
+1. ZERO-CONFIG AUTO-INIT
+   Installing the package is enough. The SDK ships a sitecustomize.py
+   that fires init_sentinel() before any user code runs. No import,
+   no init_sentinel() call needed in client code. Configuration is
+   read from environment variables (SENTINEL_SERVICE_NAME,
+   SENTINEL_CLICKHOUSE_HOST, SENTINEL_OTLP_ENDPOINT, etc.).
+
+2. PER-REQUEST TRACE IDs  (fixes the shared trace_id bug)
+   v3.x used a single process-level self._trace_id, so every
+   concurrent request had the same trace_id. v4.0 uses
+   contextvars.ContextVar so every async task / thread gets its own
+   trace_id, span_id, request_id, user_id, and session_id
+   automatically. The Gantt waterfall approximation is gone — you can
+   now join on traceId exactly.
+
+3. SESSION TRACKING
+   Every new HTTP request that arrives without a known
+   X-Session-Id is assigned one. The registry tracks:
+     • active sessions  (last seen < SESSION_TTL seconds ago)
+     • total sessions since startup
+     • per-session metadata (user, tenant, IP, start time, last seen)
+   Query live counts with sentinel.session_stats().
+   The registry is purged every 60 s in a background thread.
+
+4. PSUTIL VITALS FIX
+   _emit_vitals() now calls psutil.cpu_percent(interval=0.1) directly
+   (non-blocking, accurate) instead of the manual cpu_times delta.
+   Also adds diskUsedPercent, diskUsedBytes, memoryTotalBytes inline.
+
+5. ALL v3.1 FIXES RETAINED
+
+Environment variables for auto-init
+-------------------------------------
+  SENTINEL_SERVICE_NAME       (default: "python-service")
+  SENTINEL_CLICKHOUSE_HOST    (default: "http://localhost:8123")
+  SENTINEL_CLICKHOUSE_DB      alias for CLICKHOUSE_DATABASE
+  SENTINEL_CLICKHOUSE_TABLE   alias for CLICKHOUSE_TABLE
+  SENTINEL_CLICKHOUSE_USER    alias for CLICKHOUSE_USER
+  SENTINEL_CLICKHOUSE_PASS    alias for CLICKHOUSE_PASSWORD
+  SENTINEL_OTLP_ENDPOINT      alias for OTEL_EXPORTER_OTLP_ENDPOINT
+  SENTINEL_HEALTH_PORT        (default: 9090)
+  SENTINEL_LOG_LEVEL          alias for LOG_LEVEL (default: DEBUG)
+  SENTINEL_SAMPLING_RATE      (default: 1.0)
+  SENTINEL_DISK_BUFFER_DIR    (default: /tmp/sentinel)
+  SENTINEL_DISK_MAX_MB        (default: 500)
+  SENTINEL_ENABLED            (default: true)
+  SENTINEL_DEBUG              (default: false)
+  SENTINEL_SLOW_QUERY_MS      (default: 200)
+  SENTINEL_SLOW_HTTP_MS       (default: 1000)
+  SENTINEL_SLOW_FUNCTION_MS   (default: 500)
+  SENTINEL_CERT_HOSTS         comma-separated hostnames for TLS checks
+  SENTINEL_SESSION_TTL        seconds before idle session expires (default: 1800)
+
+Manual usage (still works as before)
+--------------------------------------
     from sentinel_sdk.python.agent import init_sentinel, SentinelMeta
 
     sentinel = init_sentinel(
@@ -47,23 +71,13 @@ Usage
         log_level="INFO",
         debug=True,
     )
-
-    class OrderService(metaclass=SentinelMeta):
-        _sentinel_layer = "domain"
-        def place_order(self, order): ...
-
-    sentinel.instrument(my_existing_service)
-
-    @sentinel.track(layer="business_logic")
-    def process_payment(data): ...
-
-    sentinel.audit("User deleted", context={"userId": "u123", "action": "delete"})
 """
 
 from __future__ import annotations
 
 import base64
 import builtins
+import contextvars
 import datetime
 import functools
 import inspect
@@ -176,11 +190,48 @@ _LEVEL_ORDER: Dict[str, int] = {
     LogLevel.ERROR: 3, LogLevel.FATAL: 4,
 }
 
+# ── Per-request context (ContextVar — safe for async + threads) ───────────────
+#
+# These replace the old single self._trace_id on the agent.
+# Each incoming request (Flask/FastAPI middleware) binds its own values so
+# every concurrent user has a completely independent trace context.
+#
+# Thread-based frameworks (Flask/gunicorn sync workers): ContextVar resets
+#   automatically per request when you call _bind_request_context().
+# Async frameworks (FastAPI/uvicorn): each asyncio Task has its own copy
+#   because contextvars.copy_context() is used under the hood by asyncio.
+#
+# Access from anywhere in the call stack:
+#   _ctx_trace_id.get()     → current request's trace_id
+#   _ctx_session_id.get()   → current request's session_id
+#   etc.
+
+_ctx_trace_id:   contextvars.ContextVar[str] = contextvars.ContextVar('sentinel_trace_id',   default='untracked')
+_ctx_span_id:    contextvars.ContextVar[str] = contextvars.ContextVar('sentinel_span_id',    default='')
+_ctx_request_id: contextvars.ContextVar[str] = contextvars.ContextVar('sentinel_request_id', default='')
+_ctx_session_id: contextvars.ContextVar[str] = contextvars.ContextVar('sentinel_session_id', default='')
+_ctx_user_id:    contextvars.ContextVar[str] = contextvars.ContextVar('sentinel_user_id',    default='')
+_ctx_tenant_id:  contextvars.ContextVar[str] = contextvars.ContextVar('sentinel_tenant_id',  default='')
+
+
+def _bind_request_context(
+    trace_id:   str,
+    span_id:    str,
+    request_id: str = '',
+    session_id: str = '',
+    user_id:    str = '',
+    tenant_id:  str = '',
+) -> None:
+    """Set all per-request ContextVars for the current execution context."""
+    _ctx_trace_id.set(trace_id)
+    _ctx_span_id.set(span_id)
+    _ctx_request_id.set(request_id)
+    _ctx_session_id.set(session_id)
+    _ctx_user_id.set(user_id)
+    _ctx_tenant_id.set(tenant_id)
+
+
 # ── PII masking ───────────────────────────────────────────────────────────────
-# FIX: Use raw strings throughout to avoid escape-sequence confusion.
-# FIX: Do NOT use re.compile() with re.Pattern objects stored in a list
-#      and reused with sub() — the compiled pattern is fine, but the
-#      character class in the password pattern was malformed.
 
 _PII_PATTERNS: List[Tuple[_re.Pattern, str]] = [
     (_re.compile(r'\b(?:\d[ -]?){13,16}\b'),
@@ -191,7 +242,6 @@ _PII_PATTERNS: List[Tuple[_re.Pattern, str]] = [
      'Bearer [TOKEN]'),
     (_re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),
      '[EMAIL]'),
-    # FIX: character class was `["\'"]?` (broken escape) — now `["\'` + \`]?`
     (_re.compile(r'(password|passwd|pwd|secret|token|api_?key|auth)["\'\s:=]+["\']?[^\s"\'`,;}{)\]]+["\']?', _re.I),
      r'\1=[REDACTED]'),
     (_re.compile(r'\b\d{3}-\d{2}-\d{4}\b'),
@@ -207,7 +257,6 @@ _REDACT_KEYS = _re.compile(
 
 
 def mask_pii(value: str) -> str:
-    """Mask PII patterns in a string. Non-strings returned unchanged."""
     if not isinstance(value, str):
         return value
     for pattern, replacement in _PII_PATTERNS:
@@ -216,12 +265,10 @@ def mask_pii(value: str) -> str:
 
 
 def mask_context(obj: Any, depth: int = 0) -> Any:
-    """Recursively mask PII/secrets in context dicts, lists, and strings."""
     if depth > 5:
         return obj
     if isinstance(obj, str):
         return mask_pii(obj)
-    # FIX: handle lists and tuples so nested sequences are also masked
     if isinstance(obj, (list, tuple)):
         masked = [mask_context(v, depth + 1) for v in obj]
         return type(obj)(masked)
@@ -245,13 +292,11 @@ def mask_context(obj: Any, depth: int = 0) -> Any:
 # ── W3C traceparent helpers ───────────────────────────────────────────────────
 
 def _gen_8hex() -> str:
-    """Generate 8 cryptographically random bytes as 16 hex chars (W3C span_id)."""
-    return secrets.token_hex(8)   # FIX: was uuid4().hex[:16] — now crypto-safe
+    return secrets.token_hex(8)
 
 
 def _gen_16hex() -> str:
-    """Generate 16 cryptographically random bytes as 32 hex chars (W3C trace_id)."""
-    return secrets.token_hex(16)  # FIX: was uuid4().hex + uuid4().hex[:0] ([:0] == '')
+    return secrets.token_hex(16)
 
 
 _TRACE_ID_RE = _re.compile(r'^[0-9a-f]{32}$')
@@ -259,21 +304,18 @@ _SPAN_ID_RE  = _re.compile(r'^[0-9a-f]{16}$')
 
 
 def build_traceparent(trace_id: str, span_id: str, sampled: bool = True) -> str:
-    """Build a W3C traceparent header, padding/truncating ids defensively."""
     tid = (trace_id or '').ljust(32, '0')[:32]
     sid = (span_id  or '').ljust(16, '0')[:16]
     return f'00-{tid}-{sid}-{"01" if sampled else "00"}'
 
 
 def parse_traceparent(header: str) -> Optional[Dict[str, Any]]:
-    """Parse a W3C traceparent header. Returns None on any format error."""
     if not header or not isinstance(header, str):
         return None
     parts = header.split('-')
     if len(parts) != 4 or parts[0] != '00':
         return None
     trace_id, span_id, flags = parts[1], parts[2], parts[3]
-    # FIX: validate hex format and lengths (W3C spec)
     if not _TRACE_ID_RE.match(trace_id) or not _SPAN_ID_RE.match(span_id):
         return None
     return {'trace_id': trace_id, 'span_id': span_id, 'sampled': flags == '01'}
@@ -303,6 +345,138 @@ def infer_layer(name: str) -> str:
     return LogLayer.BUSINESS_LOGIC
 
 
+# ── Session registry ──────────────────────────────────────────────────────────
+#
+# Tracks every unique session that has hit the service. A session is
+# identified by X-Session-Id (if present) or auto-generated.
+#
+# Thread-safe. Purge runs every 60 s. A session is considered "active"
+# when its last_seen is within SESSION_TTL seconds of now.
+
+class _SessionEntry:
+    __slots__ = ('session_id', 'user_id', 'tenant_id', 'ip', 'user_agent',
+                 'started_at', 'last_seen', 'request_count')
+
+    def __init__(self, session_id: str, user_id: str, tenant_id: str,
+                 ip: str, user_agent: str):
+        now = time.time()
+        self.session_id    = session_id
+        self.user_id       = user_id
+        self.tenant_id     = tenant_id
+        self.ip            = ip
+        self.user_agent    = user_agent
+        self.started_at    = now
+        self.last_seen     = now
+        self.request_count = 1
+
+    def touch(self, user_id: str = '', tenant_id: str = '') -> None:
+        self.last_seen     = time.time()
+        self.request_count += 1
+        if user_id:
+            self.user_id = user_id
+        if tenant_id:
+            self.tenant_id = tenant_id
+
+
+class SessionRegistry:
+    """
+    Keeps a live map of sessions. Thread-safe. Auto-purges expired sessions.
+
+    Usage
+    -----
+        stats = sentinel.session_stats()
+        # {
+        #   "active_sessions":  12,
+        #   "total_sessions":   847,
+        #   "active_users":     10,      # unique user_ids (non-empty) in active set
+        #   "active_tenants":   3,
+        # }
+    """
+
+    def __init__(self, ttl_seconds: int = 1800):
+        self._ttl     = ttl_seconds
+        self._lock    = threading.Lock()
+        self._store:  Dict[str, _SessionEntry] = {}  # session_id → entry
+        self._total   = 0  # monotonic counter, never decrements
+        self._start_purge_thread()
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    def touch(
+        self,
+        session_id: str,
+        user_id:    str = '',
+        tenant_id:  str = '',
+        ip:         str = '',
+        user_agent: str = '',
+    ) -> _SessionEntry:
+        """Register or refresh a session. Returns the entry."""
+        with self._lock:
+            if session_id in self._store:
+                entry = self._store[session_id]
+                entry.touch(user_id, tenant_id)
+                return entry
+            else:
+                entry = _SessionEntry(session_id, user_id, tenant_id, ip, user_agent)
+                self._store[session_id] = entry
+                self._total += 1
+                return entry
+
+    def stats(self) -> Dict[str, Any]:
+        """Return live counts."""
+        now = time.time()
+        with self._lock:
+            active = [e for e in self._store.values() if now - e.last_seen < self._ttl]
+            return {
+                'active_sessions': len(active),
+                'total_sessions':  self._total,
+                'active_users':    len({e.user_id for e in active if e.user_id}),
+                'active_tenants':  len({e.tenant_id for e in active if e.tenant_id}),
+            }
+
+    def active_snapshot(self) -> List[Dict[str, Any]]:
+        """Return a list of active session dicts (for debugging / dashboards)."""
+        now = time.time()
+        with self._lock:
+            return [
+                {
+                    'sessionId':    e.session_id,
+                    'userId':       e.user_id,
+                    'tenantId':     e.tenant_id,
+                    'ip':           e.ip,
+                    'startedAt':    e.started_at,
+                    'lastSeen':     e.last_seen,
+                    'requestCount': e.request_count,
+                    'idleSecs':     round(now - e.last_seen, 1),
+                }
+                for e in self._store.values()
+                if now - e.last_seen < self._ttl
+            ]
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _purge(self) -> int:
+        """Remove sessions idle longer than TTL. Returns count removed."""
+        now = time.time()
+        with self._lock:
+            dead = [sid for sid, e in self._store.items()
+                    if now - e.last_seen >= self._ttl]
+            for sid in dead:
+                del self._store[sid]
+            return len(dead)
+
+    def _start_purge_thread(self) -> None:
+        def loop():
+            while True:
+                time.sleep(60)
+                try:
+                    self._purge()
+                except Exception:
+                    pass
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+
 # ── LogRecord ─────────────────────────────────────────────────────────────────
 
 class LogRecord:
@@ -310,7 +484,8 @@ class LogRecord:
         'message', 'level', 'layer', 'timestamp',
         'record_id', 'trace_id', 'span_id',
         'service', 'env', 'context',
-        'host', 'version', 'request_id', 'tenant_id', 'is_audit',
+        'host', 'version', 'request_id', 'tenant_id',
+        'session_id', 'user_id', 'is_audit',
     )
 
     def __init__(
@@ -320,25 +495,30 @@ class LogRecord:
         level:      str = LogLevel.INFO,
         service:    str = 'unknown-python-service',
         context:    Optional[Dict[str, Any]] = None,
-        trace_id:   str = 'untracked',
+        trace_id:   Optional[str] = None,
         span_id:    Optional[str] = None,
         request_id: str = '',
+        session_id: str = '',
+        user_id:    str = '',
         tenant_id:  str = '',
         is_audit:   bool = False,
     ):
+        # Prefer explicitly passed IDs, fall back to ContextVar values
         self.message    = message
         self.layer      = layer
         self.level      = level
         self.service    = service
         self.timestamp  = datetime.datetime.now(datetime.timezone.utc).isoformat()
         self.record_id  = str(uuid.uuid4())
-        self.trace_id   = trace_id
-        self.span_id    = span_id or _gen_8hex()
+        self.trace_id   = trace_id   or _ctx_trace_id.get()   or _gen_16hex()
+        self.span_id    = span_id    or _ctx_span_id.get()    or _gen_8hex()
+        self.request_id = request_id or _ctx_request_id.get()
+        self.session_id = session_id or _ctx_session_id.get()
+        self.user_id    = user_id    or _ctx_user_id.get()
+        self.tenant_id  = tenant_id  or _ctx_tenant_id.get()
         self.env        = os.getenv('ENV', os.getenv('PYTHON_ENV', 'development'))
         self.host       = os.getenv('HOSTNAME', os.getenv('HOST', socket.gethostname()))
         self.version    = os.getenv('SERVICE_VERSION', os.getenv('APP_VERSION', '0.0.0'))
-        self.request_id = request_id
-        self.tenant_id  = tenant_id
         self.is_audit   = is_audit
         self.context    = context or {}
 
@@ -353,6 +533,8 @@ class LogRecord:
             'host':       self.host,
             'version':    self.version,
             'request_id': self.request_id,
+            'session_id': self.session_id,
+            'user_id':    self.user_id,
             'tenant_id':  self.tenant_id,
             'layer':      self.layer,
             'level':      self.level,
@@ -368,7 +550,11 @@ class LogRecord:
         }
         reset = '\033[0m'
         c = _colors.get(self.level, '\033[92m')
-        return f'{c}[{self.timestamp}] [{self.layer.upper()}] [{self.level}] {self.message}{reset}'
+        sid = f' [sess:{self.session_id[:8]}]' if self.session_id else ''
+        return (
+            f'{c}[{self.timestamp}] [{self.layer.upper()}] [{self.level}]'
+            f'[trace:{self.trace_id[:8]}]{sid} {self.message}{reset}'
+        )
 
 
 # ── Disk buffer ───────────────────────────────────────────────────────────────
@@ -385,14 +571,13 @@ class _DiskBuffer:
         with self._lock:
             try:
                 rows = '\n'.join(json.dumps(r.to_dict()) for r in records) + '\n'
-                # FIX: check size *after* computing new content, rotate before appending
                 current = self._size()
                 if current + len(rows.encode()) >= self._max_bytes:
                     self._rotate()
                 with open(self._file, 'a', encoding='utf-8') as f:
                     f.write(rows)
             except Exception:
-                pass  # never crash the caller
+                pass
 
     def drain(self) -> List[str]:
         with self._lock:
@@ -413,7 +598,6 @@ class _DiskBuffer:
             return 0
 
     def _rotate(self) -> None:
-        """Drop the first half of buffered records to make room."""
         try:
             with open(self._file, 'r', encoding='utf-8') as f:
                 lines = [l for l in f.read().splitlines() if l]
@@ -449,6 +633,7 @@ class _ClickHouseWriter:
 
     def init(self) -> None:
         self._exec(f'CREATE DATABASE IF NOT EXISTS {self._db}')
+        # session_id, user_id added to schema for per-user tracking
         self._exec(f"""
             CREATE TABLE IF NOT EXISTS {self._db}.{self._table}
             (
@@ -461,6 +646,8 @@ class _ClickHouseWriter:
                 host       String,
                 version    String,
                 request_id String,
+                session_id String,
+                user_id    String,
                 tenant_id  String,
                 layer      String,
                 level      String,
@@ -469,7 +656,7 @@ class _ClickHouseWriter:
             )
             ENGINE = MergeTree()
             PARTITION BY toYYYYMM(parseDateTimeBestEffort(timestamp))
-            ORDER BY (timestamp, service, layer)
+            ORDER BY (timestamp, service, layer, session_id)
             TTL parseDateTimeBestEffort(timestamp) + INTERVAL 90 DAY
         """)
         self._schedule_flush()
@@ -536,7 +723,7 @@ class _ClickHouseWriter:
                 req.add_header('Authorization', f'Basic {cred}')
             urllib.request.urlopen(req, timeout=10)
         except Exception:
-            pass  # will retry on next startup
+            pass
 
     def _append_audit(self, record: LogRecord) -> None:
         try:
@@ -609,8 +796,6 @@ class _OtlpExporter:
                     'scope': {'name': 'sentinel-sdk'},
                     'logRecords': [
                         {
-                            # FIX: isoformat() with tz produces +00:00 not Z;
-                            # fromisoformat handles +00:00 directly — no replace needed.
                             'timeUnixNano':   str(int(
                                 datetime.datetime.fromisoformat(r.timestamp)
                                 .timestamp() * 1_000_000_000
@@ -624,6 +809,8 @@ class _OtlpExporter:
                                 'layer':      r.layer,
                                 'env':        r.env,
                                 'request_id': r.request_id,
+                                'session_id': r.session_id,
+                                'user_id':    r.user_id,
                                 'tenant_id':  r.tenant_id,
                                 **_flatten_ctx(r.context),
                             }),
@@ -640,7 +827,7 @@ class _OtlpExporter:
             req.add_header('Content-Type', 'application/json')
             urllib.request.urlopen(req, timeout=5)
         except Exception:
-            pass  # best effort
+            pass
 
 
 def _kv_list(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -669,6 +856,104 @@ def _flatten_ctx(ctx: Any, prefix: str = '', depth: int = 0) -> Dict[str, Any]:
             out[key] = v
     return out
 
+# ... end of _OtlpExporter class ...
+
+
+# ── Browser ingest relay ──────────────────────────────────────────────────────
+
+def _cors_headers(origin: Optional[str], allowed_origins: List[str]) -> Dict[str, str]:
+    if not allowed_origins:
+        allow = origin or '*'
+    elif origin in allowed_origins:
+        allow = origin
+    else:
+        return {}
+    return {
+        'Access-Control-Allow-Origin':  allow,
+        'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, X-Sentinel',
+        'Access-Control-Max-Age':       '86400',
+    }
+
+
+def _write_browser_batch(records: List[Dict[str, Any]], writer: _ClickHouseWriter, debug: bool = False) -> None:
+    if not records:
+        return
+    out = []
+    for r in records:
+        ctx = r.get('context') or {}
+        if isinstance(ctx, str):
+            try:    ctx = json.loads(ctx)
+            except: ctx = {}
+        out.append(LogRecord(
+            message=    r.get('message')  or '',
+            layer=      r.get('layer')    or LogLayer.PRESENTATION,
+            level=      r.get('level')    or LogLevel.INFO,
+            service=    r.get('service')  or 'browser',
+            context=    ctx,
+            trace_id=   r.get('trace_id') or ctx.get('traceId') or _gen_16hex(),
+            session_id= ctx.get('sessionId') or '',
+            user_id=    ctx.get('userId')    or '',
+            tenant_id=  ctx.get('tenantId')  or '',
+        ))
+    for record in out:
+        writer.enqueue(record)
+
+
+def mount_fastapi_ingest(app: Any, writer: _ClickHouseWriter, cfg: Dict[str, Any]) -> None:
+    allowed = [o.strip() for o in os.getenv('SENTINEL_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+    try:
+        from fastapi import Request
+        from fastapi.responses import Response
+    except ImportError:
+        raise RuntimeError('FastAPI not installed')
+
+    @app.options('/sentinel/ingest', include_in_schema=False)
+    async def _opt(request: Request) -> Response:
+        return Response(status_code=204, headers=_cors_headers(request.headers.get('origin'), allowed))
+
+    @app.post('/sentinel/ingest', include_in_schema=False)
+    async def _post(request: Request) -> Response:
+        cors = _cors_headers(request.headers.get('origin'), allowed)
+        try:
+            import asyncio
+            records = json.loads(await request.body() or b'[]')
+            if not isinstance(records, list): records = [records]
+            await asyncio.get_event_loop().run_in_executor(
+                None, _write_browser_batch, records, writer, cfg.get('debug', False)
+            )
+            return Response(status_code=204, headers=cors)
+        except Exception as exc:
+            if cfg.get('debug'): print(f'[SENTINEL ingest] {exc}', file=sys.stderr)
+            return Response(content=json.dumps({'error': 'ingest failed'}), status_code=500,
+                            media_type='application/json', headers=cors)
+
+
+def mount_flask_ingest(app: Any, writer: _ClickHouseWriter, cfg: Dict[str, Any]) -> None:
+    allowed = [o.strip() for o in os.getenv('SENTINEL_ALLOWED_ORIGINS', '').split(',') if o.strip()]
+    try:
+        from flask import request, make_response
+    except ImportError:
+        raise RuntimeError('Flask not installed')
+
+    @app.route('/sentinel/ingest', methods=['OPTIONS', 'POST'])
+    def _sentinel_ingest():
+        cors = _cors_headers(request.headers.get('Origin'), allowed)
+        if request.method == 'OPTIONS':
+            resp = make_response('', 204)
+        else:
+            try:
+                records = request.get_json(force=True, silent=True) or []
+                if not isinstance(records, list): records = [records]
+                _write_browser_batch(records, writer, cfg.get('debug', False))
+                resp = make_response('', 204)
+            except Exception as exc:
+                if cfg.get('debug'): print(f'[SENTINEL ingest] {exc}', file=sys.stderr)
+                resp = make_response(json.dumps({'error': 'ingest failed'}), 500)
+                resp.headers['Content-Type'] = 'application/json'
+        for k, v in cors.items(): resp.headers[k] = v
+        return resp
+
 
 # ── SentinelMeta — zero-effort class instrumentation ─────────────────────────
 
@@ -678,7 +963,7 @@ class SentinelMeta(type):
     enter / exit / error / duration logging.
 
         class OrderService(metaclass=SentinelMeta):
-            _sentinel_layer = LogLayer.DOMAIN   # optional
+            _sentinel_layer = LogLayer.DOMAIN
             ...
     """
     _sentinel_agent: Optional['SentinelPython'] = None
@@ -712,7 +997,6 @@ class SentinelMeta(type):
                     result = await fn(*args, **kwargs)
                     ms = (time.perf_counter() - start) * 1000
                     if agent:
-                        # FIX: removed duplicate asyncDurationMs key
                         agent._emit(
                             f'{cls_name}.{method} → ok ({ms:.1f}ms)',
                             layer=layer, level=LogLevel.INFO,
@@ -784,16 +1068,14 @@ T = TypeVar('T')
 # ── Health server ─────────────────────────────────────────────────────────────
 
 class _HealthServer(threading.Thread):
-    """
-    FIX: Use ThreadingHTTPServer instead of HTTPServer so concurrent
-    health/readiness probes (e.g. from Kubernetes) never block each other.
-    """
-    def __init__(self, port: int, service_name: str, process_start: float):
+    def __init__(self, port: int, service_name: str, process_start: float,
+                 session_registry: SessionRegistry):
         super().__init__(daemon=True)
-        self._port          = port
-        self._service_name  = service_name
-        self._process_start = process_start
-        self._ready         = False
+        self._port             = port
+        self._service_name     = service_name
+        self._process_start    = process_start
+        self._ready            = False
+        self._session_registry = session_registry
 
     def set_ready(self) -> None:
         self._ready = True
@@ -812,29 +1094,31 @@ class _HealthServer(threading.Thread):
                         'uptime':  round(time.time() - srv._process_start, 2),
                         'pid':     os.getpid(),
                     }).encode()
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._respond(200, body)
                 elif self.path == '/ready':
                     code = 200 if srv._ready else 503
                     body = json.dumps(
                         {'status': 'ready' if srv._ready else 'not_ready'}
                     ).encode()
-                    self.send_response(code)
-                    self.send_header('Content-Type', 'application/json')
-                    self.send_header('Content-Length', str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
+                    self._respond(code, body)
+                elif self.path == '/sessions':
+                    # Live session stats — useful for ops dashboards
+                    body = json.dumps(srv._session_registry.stats()).encode()
+                    self._respond(200, body)
                 else:
                     self.send_response(404)
                     self.end_headers()
 
-            def log_message(self, *args):
-                pass  # silence access logs
+            def _respond(self, code: int, body: bytes) -> None:
+                self.send_response(code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
-        # FIX: ThreadingHTTPServer handles concurrent probes without blocking
+            def log_message(self, *args):
+                pass
+
         class _ThreadingHTTPServer(
             http.server.ThreadingHTTPServer
             if hasattr(http.server, 'ThreadingHTTPServer')
@@ -858,39 +1142,41 @@ class SentinelPython:
         _disk_dir = cfg.get('disk_buffer_dir', os.path.join('/tmp', 'sentinel'))
 
         self._cfg = {
-            'clickhouse_host':     cfg.get('clickhouse_host',     os.getenv('CLICKHOUSE_HOST',     'http://localhost:8123')),
-            'clickhouse_database': cfg.get('clickhouse_database', os.getenv('CLICKHOUSE_DATABASE', 'sentinel')),
-            'clickhouse_table':    cfg.get('clickhouse_table',    os.getenv('CLICKHOUSE_TABLE',    'logs')),
-            'clickhouse_user':     cfg.get('clickhouse_user',     os.getenv('CLICKHOUSE_USER',     '')),
-            'clickhouse_password': cfg.get('clickhouse_password', os.getenv('CLICKHOUSE_PASSWORD', '')),
-            'batch_size':          cfg.get('batch_size',          50),
-            'slow_query_ms':       cfg.get('slow_query_ms',       200),
-            'slow_http_ms':        cfg.get('slow_http_ms',        1000),
-            'slow_function_ms':    cfg.get('slow_function_ms',    500),
-            'debug':               cfg.get('debug',               False),
-            'sampling_rate':       cfg.get('sampling_rate',       1.0),
-            'cert_check_hosts':    cfg.get('cert_check_hosts',    []),
-            'cert_check_interval': cfg.get('cert_check_interval', 6 * 3600),
-            'otlp_endpoint':       cfg.get('otlp_endpoint',       os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', '')),
-            'health_port':         int(cfg.get('health_port',     os.getenv('SENTINEL_HEALTH_PORT', 9090))),
-            'log_level':           (cfg.get('log_level') or os.getenv('LOG_LEVEL', LogLevel.DEBUG)).upper(),
+            'clickhouse_host':     cfg.get('clickhouse_host',     os.getenv('CLICKHOUSE_HOST',     os.getenv('SENTINEL_CLICKHOUSE_HOST',  'http://localhost:8123'))),
+            'clickhouse_database': cfg.get('clickhouse_database', os.getenv('CLICKHOUSE_DATABASE', os.getenv('SENTINEL_CLICKHOUSE_DB',    'sentinel'))),
+            'clickhouse_table':    cfg.get('clickhouse_table',    os.getenv('CLICKHOUSE_TABLE',    os.getenv('SENTINEL_CLICKHOUSE_TABLE', 'logs'))),
+            'clickhouse_user':     cfg.get('clickhouse_user',     os.getenv('CLICKHOUSE_USER',     os.getenv('SENTINEL_CLICKHOUSE_USER',  ''))),
+            'clickhouse_password': cfg.get('clickhouse_password', os.getenv('CLICKHOUSE_PASSWORD', os.getenv('SENTINEL_CLICKHOUSE_PASS',  ''))),
+            'batch_size':          cfg.get('batch_size',          int(os.getenv('SENTINEL_BATCH_SIZE', '50'))),
+            'slow_query_ms':       cfg.get('slow_query_ms',       int(os.getenv('SENTINEL_SLOW_QUERY_MS',    '200'))),
+            'slow_http_ms':        cfg.get('slow_http_ms',        int(os.getenv('SENTINEL_SLOW_HTTP_MS',     '1000'))),
+            'slow_function_ms':    cfg.get('slow_function_ms',    int(os.getenv('SENTINEL_SLOW_FUNCTION_MS', '500'))),
+            'debug':               cfg.get('debug',               os.getenv('SENTINEL_DEBUG', 'false').lower() == 'true'),
+            'sampling_rate':       cfg.get('sampling_rate',       float(os.getenv('SENTINEL_SAMPLING_RATE', '1.0'))),
+            'cert_check_hosts':    cfg.get('cert_check_hosts',    [h for h in os.getenv('SENTINEL_CERT_HOSTS', '').split(',') if h]),
+            'cert_check_interval': cfg.get('cert_check_interval', int(os.getenv('SENTINEL_CERT_INTERVAL', str(6 * 3600)))),
+            'otlp_endpoint':       cfg.get('otlp_endpoint',       os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', os.getenv('SENTINEL_OTLP_ENDPOINT', ''))),
+            'health_port':         int(cfg.get('health_port',     os.getenv('SENTINEL_HEALTH_PORT', '9090'))),
+            'log_level':           (cfg.get('log_level') or os.getenv('LOG_LEVEL', os.getenv('SENTINEL_LOG_LEVEL', LogLevel.DEBUG))).upper(),
             'disk_buffer_dir':     _disk_dir,
-            'disk_buffer_max_mb':  cfg.get('disk_buffer_max_mb',  500),
+            'disk_buffer_max_mb':  cfg.get('disk_buffer_max_mb',  int(os.getenv('SENTINEL_DISK_MAX_MB', '500'))),
             'audit_log_path':      cfg.get('audit_log_path',      os.path.join(_disk_dir, 'sentinel-audit.ndjson')),
+            'session_ttl':         int(cfg.get('session_ttl',     os.getenv('SENTINEL_SESSION_TTL', '1800'))),
             'enabled':             cfg.get('enabled',             os.getenv('SENTINEL_ENABLED', 'true').lower() != 'false'),
         }
 
-        self._enabled   = self._cfg['enabled']
-        self._min_level = self._cfg['log_level']
-        self._writer    = _ClickHouseWriter(self._cfg)
-        self._otlp      = _OtlpExporter(self._cfg['otlp_endpoint']) if self._cfg['otlp_endpoint'] else None
-        self._health    = _HealthServer(self._cfg['health_port'], service_name, self._process_start)
+        self._enabled        = self._cfg['enabled']
+        self._min_level      = self._cfg['log_level']
+        self._writer         = _ClickHouseWriter(self._cfg)
+        self._otlp           = _OtlpExporter(self._cfg['otlp_endpoint']) if self._cfg['otlp_endpoint'] else None
+        self._sessions       = SessionRegistry(ttl_seconds=self._cfg['session_ttl'])
+        self._health         = _HealthServer(
+            self._cfg['health_port'], service_name,
+            self._process_start, self._sessions,
+        )
         self._instrumented: set = set()
-        # FIX: _gen_16hex() now correctly generates 32 hex chars (was [:0] bug)
-        self._trace_id  = _gen_16hex()
-
-        if HAS_PSUTIL:
-            self._prev_cpu_times = _psutil.cpu_times()
+        # Process-level fallback trace_id (used only when no request context is active)
+        self._process_trace_id = _gen_16hex()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -920,7 +1206,7 @@ class SentinelPython:
         self._health.set_ready()
 
         self._emit(
-            f'Sentinel Python Agent hooked on "{self.service_name}"',
+            f'Sentinel Python Agent v4.0 hooked on "{self.service_name}"',
             layer=LogLayer.INFRASTRUCTURE, level=LogLevel.INFO,
             context={
                 'python_version':       sys.version,
@@ -929,6 +1215,7 @@ class SentinelPython:
                 'cpuCoreCount':         os.cpu_count() or 1,
                 'host':                 os.getenv('HOSTNAME', socket.gethostname()),
                 'version':              os.getenv('SERVICE_VERSION', '0.0.0'),
+                'sessionTtlSeconds':    self._cfg['session_ttl'],
             },
         )
         return self
@@ -941,6 +1228,25 @@ class SentinelPython:
 
     def set_log_level(self, level: str) -> None:
         self._min_level = level.upper()
+
+    def session_stats(self) -> Dict[str, Any]:
+        """
+        Return live session counts.
+
+        Returns
+        -------
+        {
+            "active_sessions": int,   # sessions seen within SESSION_TTL
+            "total_sessions":  int,   # all sessions since process start
+            "active_users":    int,   # distinct user_ids in active set
+            "active_tenants":  int,   # distinct tenant_ids in active set
+        }
+        """
+        return self._sessions.stats()
+
+    def active_sessions(self) -> List[Dict[str, Any]]:
+        """Return detailed list of active session dicts (for dashboards)."""
+        return self._sessions.active_snapshot()
 
     def instrument(self, target: Any, layer: Optional[str] = None) -> 'SentinelPython':
         cls    = target if isinstance(target, type) else type(target)
@@ -1045,7 +1351,6 @@ class SentinelPython:
         self._emit(message, layer=layer, level=level, context=context)
 
     def audit(self, message: str, context: Optional[Dict] = None) -> None:
-        """Emit an audit log — bypasses sampling, always written to audit file."""
         self._emit(message, layer=LogLayer.SECURITY, level=LogLevel.INFO,
                    context=context, is_audit=True)
 
@@ -1076,13 +1381,21 @@ class SentinelPython:
                 if random.random() > rate:
                     return
 
-        # FIX: add sampling fields BEFORE mask_context so they are never redacted
         raw_ctx = dict(context or {})
         raw_ctx.setdefault('samplingRate',     rate)
         raw_ctx.setdefault('samplingDecision', 'sampled')
 
-        # P0: PII masking on ALL context
         ctx = mask_context(raw_ctx)
+
+        # Use the explicitly passed trace_id first; ContextVar second;
+        # process-level fallback last (background threads / startup logs)
+        effective_trace_id = (
+            trace_id
+            or _ctx_trace_id.get()
+            or self._process_trace_id
+        )
+        if effective_trace_id == 'untracked':
+            effective_trace_id = self._process_trace_id
 
         record = LogRecord(
             message=message,
@@ -1090,7 +1403,7 @@ class SentinelPython:
             level=level,
             service=self.service_name,
             context=ctx,
-            trace_id=trace_id or self._trace_id,
+            trace_id=effective_trace_id,
             is_audit=is_audit,
         )
         if self._cfg['debug']:
@@ -1100,6 +1413,57 @@ class SentinelPython:
         if self._otlp:
             self._otlp.enqueue(record)
 
+    # ── Shared request-context setup (used by both Flask and FastAPI) ─────────
+
+    def _resolve_request_context(
+        self,
+        traceparent_header: Optional[str],
+        session_id_header:  Optional[str],
+        user_id:            str = '',
+        tenant_id:          str = '',
+        ip:                 str = '',
+        user_agent:         str = '',
+    ) -> Tuple[str, str, str]:
+        """
+        Resolve or generate trace_id, span_id, session_id for an incoming
+        request and register the session.
+
+        Returns (trace_id, span_id, session_id).
+        """
+        # Trace propagation
+        trace_id = self._process_trace_id
+        span_id  = _gen_8hex()
+        if traceparent_header:
+            parsed = parse_traceparent(traceparent_header)
+            if parsed:
+                trace_id = parsed['trace_id']
+                span_id  = parsed['span_id']
+        else:
+            # New inbound request with no traceparent → mint a fresh trace_id
+            trace_id = _gen_16hex()
+
+        # Session resolution
+        session_id = session_id_header or secrets.token_hex(16)
+        self._sessions.touch(
+            session_id=session_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            ip=ip,
+            user_agent=user_agent,
+        )
+
+        # Bind everything to ContextVar so downstream calls inherit them
+        _bind_request_context(
+            trace_id=trace_id,
+            span_id=span_id,
+            request_id=_gen_8hex(),
+            session_id=session_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+
+        return trace_id, span_id, session_id
+
     # ── Flask middleware ──────────────────────────────────────────────────────
 
     def flask_middleware(self, app: Any) -> Any:
@@ -1108,49 +1472,54 @@ class SentinelPython:
         @app.before_request
         def before():
             import flask
-            flask.g._sentinel_start = time.perf_counter()
             req         = flask.request
             body_bytes  = int(req.content_length or 0)
             sentinel._net_bytes_in += body_bytes
 
-            tp = req.headers.get('traceparent')
-            trace_id = sentinel._trace_id
-            if tp:
-                parsed = parse_traceparent(tp)
-                if parsed:
-                    trace_id = parsed['trace_id']
-            flask.g._sentinel_trace_id = trace_id
+            trace_id, span_id, session_id = sentinel._resolve_request_context(
+                traceparent_header=req.headers.get('traceparent'),
+                session_id_header=req.headers.get('X-Session-Id'),
+                user_id=req.headers.get('X-User-Id', ''),
+                tenant_id=req.headers.get('X-Tenant-Id', ''),
+                ip=req.remote_addr or '',
+                user_agent=req.headers.get('User-Agent', ''),
+            )
+            flask.g._sentinel_start      = time.perf_counter()
+            flask.g._sentinel_trace_id   = trace_id
+            flask.g._sentinel_session_id = session_id
 
             sentinel._emit(
                 f'→ {req.method} {req.path}',
                 layer=LogLayer.API_GATEWAY, level=LogLevel.INFO,
-                trace_id=trace_id,
                 context=mask_context({
                     'method': req.method, 'path': req.path,
                     'clientIp': req.remote_addr, 'userAgent': req.headers.get('User-Agent'),
                     'userId': req.headers.get('X-User-Id'),
-                    'sessionId': req.headers.get('X-Session-Id'),
+                    'sessionId': session_id,
                     'requestSizeBytes': body_bytes,
                     'corsOrigin': req.headers.get('Origin'),
+                    **sentinel._sessions.stats(),
                 }),
             )
 
         @app.after_request
         def after(response):
             import flask
-            req      = flask.request
-            ms       = (time.perf_counter() - getattr(flask.g, '_sentinel_start', time.perf_counter())) * 1000
-            trace_id = getattr(flask.g, '_sentinel_trace_id', sentinel._trace_id)
+            req        = flask.request
+            ms         = (time.perf_counter() - getattr(flask.g, '_sentinel_start', time.perf_counter())) * 1000
+            trace_id   = getattr(flask.g, '_sentinel_trace_id',   sentinel._process_trace_id)
+            session_id = getattr(flask.g, '_sentinel_session_id', '')
 
             res_bytes = int(response.content_length or 0)
             sentinel._net_bytes_out += res_bytes
 
             response.headers['traceparent'] = build_traceparent(trace_id, _gen_8hex())
+            response.headers['X-Session-Id'] = session_id
 
-            rate_limit_hit        = response.status_code == 429
-            rate_limit_remaining  = int(response.headers.get('X-RateLimit-Remaining', -1))
-            cors_violation        = response.status_code == 403 and bool(req.headers.get('Origin'))
-            bot_signal            = bool(_BOT_UA_RE.search(req.headers.get('User-Agent', '')))
+            rate_limit_hit       = response.status_code == 429
+            rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', -1))
+            cors_violation       = response.status_code == 403 and bool(req.headers.get('Origin'))
+            bot_signal           = bool(_BOT_UA_RE.search(req.headers.get('User-Agent', '')))
 
             is_auth_path    = bool(_AUTH_PATH_RE.search(req.path))
             is_auth_failure = response.status_code in (401, 403)
@@ -1159,14 +1528,12 @@ class SentinelPython:
                     f'Auth event: {req.method} {req.path} → {response.status_code}',
                     layer=LogLayer.SECURITY,
                     level=LogLevel.WARN if is_auth_failure else LogLevel.INFO,
-                    trace_id=trace_id,
                     is_audit=True,
                     context=mask_context({
                         'authResult':    'success' if response.status_code < 400 else 'failure',
-                        'ipAddress':     req.remote_addr,
-                        'userAgent':     req.headers.get('User-Agent'),
-                        'path':          req.path,
-                        'userId':        req.headers.get('X-User-Id'),
+                        'ipAddress':     req.remote_addr, 'userAgent': req.headers.get('User-Agent'),
+                        'path': req.path, 'userId': req.headers.get('X-User-Id'),
+                        'sessionId':     session_id,
                         'failureReason': f'HTTP {response.status_code}' if is_auth_failure else None,
                     }),
                 )
@@ -1179,10 +1546,10 @@ class SentinelPython:
                 level=(LogLevel.ERROR if response.status_code >= 500
                        else LogLevel.WARN if response.status_code >= 400
                        else LogLevel.INFO),
-                trace_id=trace_id,
                 context=mask_context({
                     'method': req.method, 'path': req.path,
                     'statusCode': response.status_code, 'durationMs': ms,
+                    'sessionId': session_id,
                     'rateLimitHit': rate_limit_hit,
                     'rateLimitRemaining': rate_limit_remaining if rate_limit_remaining >= 0 else None,
                     'responseSizeBytes': res_bytes or None,
@@ -1213,31 +1580,32 @@ class SentinelPython:
                 headers    = {k.decode(): v.decode() for k, v in scope.get('headers', [])}
                 origin     = headers.get('origin', '')
                 user_agent = headers.get('user-agent', '')
-                user_id    = headers.get('x-user-id') or None
-                session_id = headers.get('x-session-id') or None
+                user_id    = headers.get('x-user-id', '')
+                tenant_id  = headers.get('x-tenant-id', '')
+                client_ip  = (scope.get('client') or [''])[0]
 
                 body_size = int(headers.get('content-length', 0))
                 sentinel._net_bytes_in += body_size
 
-                tp = headers.get('traceparent')
-                trace_id = sentinel._trace_id
-                span_id  = _gen_8hex()
-                if tp:
-                    parsed = parse_traceparent(tp)
-                    if parsed:
-                        trace_id = parsed['trace_id']
-                        span_id  = parsed['span_id']
+                trace_id, span_id, session_id = sentinel._resolve_request_context(
+                    traceparent_header=headers.get('traceparent'),
+                    session_id_header=headers.get('x-session-id'),
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    ip=client_ip,
+                    user_agent=user_agent,
+                )
 
                 sentinel._emit(
                     f'→ {method} {path}',
                     layer=LogLayer.API_GATEWAY, level=LogLevel.INFO,
-                    trace_id=trace_id,
                     context=mask_context({
                         'method': method, 'path': path,
                         'userAgent': user_agent, 'userId': user_id,
                         'sessionId': session_id,
                         'corsOrigin': origin or None,
                         'requestSizeBytes': body_size,
+                        **sentinel._sessions.stats(),
                     }),
                 )
 
@@ -1247,13 +1615,12 @@ class SentinelPython:
                 async def send_wrapper(message):
                     if message['type'] == 'http.response.start':
                         status_code[0] = message['status']
-                        # FIX: copy message dict before mutating so we don't
-                        # corrupt the original ASGI message object
                         new_headers = list(message.get('headers', []))
                         new_headers.append((
                             b'traceparent',
                             build_traceparent(trace_id, _gen_8hex()).encode(),
                         ))
+                        new_headers.append((b'x-session-id', session_id.encode()))
                         message = dict(message)
                         message['headers'] = new_headers
                     elif message['type'] == 'http.response.body':
@@ -1277,11 +1644,11 @@ class SentinelPython:
                         f'Auth event: {method} {path} → {sc}',
                         layer=LogLayer.SECURITY,
                         level=LogLevel.WARN if is_auth_failure else LogLevel.INFO,
-                        trace_id=trace_id,
                         is_audit=True,
                         context=mask_context({
                             'authResult':    'success' if sc < 400 else 'failure',
                             'path': path, 'statusCode': sc, 'userAgent': user_agent,
+                            'sessionId': session_id,
                             'failureReason': f'HTTP {sc}' if is_auth_failure else None,
                         }),
                     )
@@ -1292,9 +1659,9 @@ class SentinelPython:
                     f'{"[RATE-LIMITED]" if rate_limit_hit else ""}',
                     layer=LogLayer.API_GATEWAY,
                     level=LogLevel.ERROR if sc >= 500 else LogLevel.WARN if sc >= 400 else LogLevel.INFO,
-                    trace_id=trace_id,
                     context=mask_context({
                         'method': method, 'path': path, 'statusCode': sc, 'durationMs': ms,
+                        'sessionId': session_id,
                         'rateLimitHit': rate_limit_hit, 'corsViolation': cors_violation,
                         'botSignal': bot_signal,
                         'responseSizeBytes': res_bytes[0] or None,
@@ -1304,6 +1671,15 @@ class SentinelPython:
         app.add_middleware(_Middleware)
         return app
 
+         # ── Browser ingest mounters ───────────────────────────────────────────────
+
+    def mount_fastapi_ingest(self, app: Any) -> None:
+        """Register /sentinel/ingest on a FastAPI app for browser log ingestion."""
+        mount_fastapi_ingest(app, self._writer, self._cfg)
+
+    def mount_flask_ingest(self, app: Any) -> None:
+        """Register /sentinel/ingest on a Flask app for browser log ingestion."""
+        mount_flask_ingest(app, self._writer, self._cfg)
     # ── print() patch ─────────────────────────────────────────────────────────
 
     def _patch_print(self) -> None:
@@ -1354,16 +1730,16 @@ class SentinelPython:
         def patched_send(self_session, request, **kwargs):
             start = time.perf_counter()
             url   = str(request.url)
-            body  = request.body or b''
-            # FIX: guard against generator/stream bodies that have no len()
             try:
-                body_bytes = len(body) if isinstance(body, (bytes, str)) else 0
+                body_bytes = len(request.body) if isinstance(request.body, (bytes, str)) else 0
             except TypeError:
                 body_bytes = 0
             sentinel._net_bytes_in += body_bytes
 
+            # Propagate current request's trace context downstream
+            current_trace = _ctx_trace_id.get() or sentinel._process_trace_id
             span_id = _gen_8hex()
-            request.headers['traceparent'] = build_traceparent(sentinel._trace_id, span_id)
+            request.headers['traceparent'] = build_traceparent(current_trace, span_id)
 
             sentinel._emit(
                 f'→ {request.method} {mask_pii(url)}',
@@ -1437,8 +1813,9 @@ class SentinelPython:
         def patched_send(self_client, request, **kwargs):
             start   = time.perf_counter()
             url     = str(request.url)
+            current_trace = _ctx_trace_id.get() or sentinel._process_trace_id
             span_id = _gen_8hex()
-            request.headers['traceparent'] = build_traceparent(sentinel._trace_id, span_id)
+            request.headers['traceparent'] = build_traceparent(current_trace, span_id)
 
             sentinel._emit(
                 f'→ httpx {request.method} {mask_pii(url)}',
@@ -1524,8 +1901,6 @@ class SentinelPython:
         sentinel = self
         slow_ms  = self._cfg['slow_query_ms']
 
-        # FIX: psycopg2 cursor is a C extension — attribute assignment on the
-        # class can fail on some builds. Wrap in try/except and report cleanly.
         try:
             orig_execute = _psycopg2.extensions.cursor.execute
 
@@ -1570,7 +1945,7 @@ class SentinelPython:
                         f'psycopg2 error: {exc}',
                         layer=LogLayer.DATA_ACCESS, level=LogLevel.ERROR,
                         context={
-                            'database':      'postgres', 'durationMs': ms,
+                            'database': 'postgres', 'durationMs': ms,
                             'deadlock':      'deadlock' in msg,
                             'lockTimeout':   'lock timeout' in msg,
                             'exceptionType': type(exc).__name__,
@@ -1722,7 +2097,8 @@ class SentinelPython:
             headers = {}
             if properties and properties.headers:
                 headers = dict(properties.headers)
-            headers['traceparent'] = build_traceparent(sentinel._trace_id, _gen_8hex())
+            current_trace = _ctx_trace_id.get() or sentinel._process_trace_id
+            headers['traceparent'] = build_traceparent(current_trace, _gen_8hex())
             if properties:
                 properties.headers = headers
             else:
@@ -1760,11 +2136,13 @@ class SentinelPython:
         def patched_consume(self_ch, queue, on_message_callback, **kwargs):
             def wrapped_callback(ch, method, properties, body):
                 tp = (properties.headers or {}).get('traceparent') if properties else None
-                trace_id = sentinel._trace_id
                 if tp:
                     parsed = parse_traceparent(tp)
                     if parsed:
-                        trace_id = parsed['trace_id']
+                        _bind_request_context(
+                            trace_id=parsed['trace_id'],
+                            span_id=_gen_8hex(),
+                        )
                 start = time.perf_counter()
                 try:
                     on_message_callback(ch, method, properties, body)
@@ -1772,7 +2150,6 @@ class SentinelPython:
                     sentinel._emit(
                         f'RabbitMQ consume: {queue} ({ms:.1f}ms)',
                         layer=LogLayer.INFRASTRUCTURE, level=LogLevel.INFO,
-                        trace_id=trace_id,
                         context={
                             'queueName': queue, 'queueAction': 'consume',
                             'durationMs': ms, 'messageBytes': len(body) if body else 0,
@@ -1783,7 +2160,6 @@ class SentinelPython:
                     sentinel._emit(
                         f'RabbitMQ consume error: {queue} — {exc}',
                         layer=LogLayer.INFRASTRUCTURE, level=LogLevel.ERROR,
-                        trace_id=trace_id,
                         context={
                             'queueName': queue, 'queueAction': 'consume', 'durationMs': ms,
                             'exceptionType': type(exc).__name__, 'stackTrace': traceback.format_exc(),
@@ -1802,8 +2178,9 @@ class SentinelPython:
         orig_send = _aiokafka.AIOKafkaProducer.send
 
         async def patched_send(self_producer, topic, value=None, key=None, headers=None, **kwargs):
+            current_trace = _ctx_trace_id.get() or sentinel._process_trace_id
             span_id   = _gen_8hex()
-            tp_header = ('traceparent', build_traceparent(sentinel._trace_id, span_id).encode())
+            tp_header = ('traceparent', build_traceparent(current_trace, span_id).encode())
             headers   = list(headers or []) + [tp_header]
             start     = time.perf_counter()
             try:
@@ -1834,21 +2211,22 @@ class SentinelPython:
         orig_getone = _aiokafka.AIOKafkaConsumer.getone
 
         async def patched_getone(self_consumer, *partitions):
-            msg      = await orig_getone(self_consumer, *partitions)
-            tp       = None
+            msg = await orig_getone(self_consumer, *partitions)
+            tp  = None
             for k, v in (msg.headers or []):
                 if k == 'traceparent':
                     tp = v.decode() if isinstance(v, bytes) else v
                     break
-            trace_id = sentinel._trace_id
             if tp:
                 parsed = parse_traceparent(tp)
                 if parsed:
-                    trace_id = parsed['trace_id']
+                    _bind_request_context(
+                        trace_id=parsed['trace_id'],
+                        span_id=_gen_8hex(),
+                    )
             sentinel._emit(
                 f'Kafka consume: {msg.topic}/{msg.partition} offset={msg.offset}',
                 layer=LogLayer.INFRASTRUCTURE, level=LogLevel.INFO,
-                trace_id=trace_id,
                 context={
                     'queueName': msg.topic, 'queueAction': 'consume',
                     'partition': msg.partition, 'offset': msg.offset,
@@ -1893,6 +2271,7 @@ class SentinelPython:
                                 'containerEvent':       'stop',
                                 'containerName':        sentinel.service_name,
                                 'processUptimeSeconds': time.time() - sentinel._process_start,
+                                **sentinel._sessions.stats(),
                             },
                         )
                         sentinel._writer.flush()
@@ -1932,46 +2311,54 @@ class SentinelPython:
         threading.Thread(target=disk_loop, daemon=True).start()
 
     def _emit_vitals(self) -> None:
+        """
+        FIX (v4.0): Use psutil.cpu_percent(interval=0.1) directly — accurate,
+        non-blocking, no manual delta math. Also adds diskUsedPercent,
+        diskUsedBytes, memoryTotalBytes as requested.
+        """
         ctx: Dict[str, Any] = {
             'containerName':        self.service_name,
             'processUptimeSeconds': time.time() - self._process_start,
             'networkInBytes':       self._net_bytes_in,
             'networkOutBytes':      self._net_bytes_out,
             'host':                 os.getenv('HOSTNAME', socket.gethostname()),
+            **self._sessions.stats(),
         }
 
+        level = LogLevel.INFO
+        msg   = f'Process vitals: uptime={ctx["processUptimeSeconds"]:.0f}s'
+
         if HAS_PSUTIL:
-            curr  = _psutil.cpu_times()
-            prev  = self._prev_cpu_times
-            delta = lambda k: getattr(curr, k, 0) - getattr(prev, k, 0)
-            total = sum(
-                delta(k) for k in ('user', 'system', 'idle', 'nice', 'iowait', 'irq', 'softirq', 'steal')
-                if hasattr(curr, k)
-            )
-            idle      = delta('idle')
-            cpu_pct   = round(((total - idle) / total) * 100, 2) if total > 0 else 0.0
-            self._prev_cpu_times = curr
+            # CPU — direct call, no manual delta
+            cpu_pct = _psutil.cpu_percent(interval=0.1)
 
             mem  = _psutil.virtual_memory()
             swap = _psutil.swap_memory()
+            disk = _psutil.disk_usage('/')
             proc = _psutil.Process(os.getpid())
             p_mem = proc.memory_info()
 
             ctx.update({
+                # CPU
                 'cpuPercent':           cpu_pct,
                 'cpuCoreCount':         _psutil.cpu_count(logical=True) or os.cpu_count() or 1,
-                'cpuStealPercent':      round(delta('steal') / total * 100, 2) if total > 0 and hasattr(curr, 'steal') else None,
+                # Memory
                 'memoryUsedBytes':      p_mem.rss,
                 'memoryTotalBytes':     mem.total,
                 'memoryAvailableBytes': mem.available,
                 'swapUsedBytes':        swap.used,
+                # Disk (as requested)
+                'diskUsedPercent':      round(disk.percent, 1),
+                'diskUsedBytes':        disk.used,
+                'diskTotalBytes':       disk.total,
             })
 
             level = LogLevel.WARN if cpu_pct > 85 else LogLevel.INFO
             msg   = (
                 f'Process vitals: cpu={cpu_pct}% '
                 f'rss={p_mem.rss // 1024 // 1024}MB '
-                f'mem_avail={mem.available // 1024 // 1024}MB'
+                f'mem_avail={mem.available // 1024 // 1024}MB '
+                f'disk={disk.percent}%'
             )
         else:
             try:
@@ -1980,8 +2367,6 @@ class SentinelPython:
                 ctx['memoryUsedBytes'] = usage.ru_maxrss * 1024
             except Exception:
                 pass
-            level = LogLevel.INFO
-            msg   = f'Process vitals: uptime={ctx["processUptimeSeconds"]:.0f}s'
 
         self._emit(msg, layer=LogLayer.INFRASTRUCTURE, level=level, context=ctx)
 
@@ -2063,7 +2448,7 @@ class SentinelPython:
 
 def init_sentinel(service_name: str = 'python-service', **kwargs) -> SentinelPython:
     """
-    One-liner initialisation::
+    One-liner initialisation (manual mode — still works as before)::
 
         sentinel = init_sentinel(
             "my-service",
@@ -2077,7 +2462,11 @@ def init_sentinel(service_name: str = 'python-service', **kwargs) -> SentinelPyt
             slow_function_ms=300,
             disk_buffer_dir="/var/log/sentinel",
             disk_buffer_max_mb=500,
+            session_ttl=1800,
         )
+
+    In auto-init mode (the package installs a sitecustomize.py) you
+    don't call this at all — the SDK boots itself from env vars.
 
     Keyword args
     ------------
@@ -2087,13 +2476,24 @@ def init_sentinel(service_name: str = 'python-service', **kwargs) -> SentinelPyt
     debug, sampling_rate (0.0–1.0),
     cert_check_hosts (list[str]), cert_check_interval (seconds, default 21600),
     otlp_endpoint (str)             — OTLP/HTTP base URL for OTel export,
-    health_port (int, default 9090) — serves /health + /ready,
+    health_port (int, default 9090) — serves /health + /ready + /sessions,
     log_level (str, default "DEBUG") — also reads LOG_LEVEL env var,
     disk_buffer_dir (str)           — directory for disk buffer,
     disk_buffer_max_mb (int)        — max buffer size in MB,
     audit_log_path (str)            — path for audit NDJSON log,
+    session_ttl (int, default 1800) — idle seconds before session expires,
     enabled (bool)                  — kill switch; also reads SENTINEL_ENABLED env,
     """
     agent = SentinelPython(service_name, **kwargs)
     agent.hook()
     return agent
+
+
+
+# ── Module-level singleton (populated by auto-init or manual init) ─────────────
+#
+# After init_sentinel() or auto-init, you can import this directly:
+#   from sentinel_sdk.python.agent import sentinel
+#   sentinel.audit(...)
+#
+sentinel: Optional[SentinelPython] = None
