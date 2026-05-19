@@ -3,6 +3,11 @@
   "version": "1.0.0",
   "description": "Cross-stack auto-hooking logging system",
   "type": "module",
+  "exports": {
+    ".": "./sentinel-sdk/core/types.ts",
+    "./browser": "./sentinel-sdk/browser/agent.ts",
+    "./node": "./sentinel-sdk/node/agent.ts"
+  },
   "bin": {
     "sentinel-sdk": "./cli.js"
   },
