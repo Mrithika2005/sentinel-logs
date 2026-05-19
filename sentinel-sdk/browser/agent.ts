@@ -1,16 +1,19 @@
 /* ============================================================
-   SENTINEL SDK — Browser Agent  (final, complete)
-   Auto-instruments:
-     • fetch + XHR (with rate-limit, auth, retry detection)
-     • Navigation (SPA + page load + previousPage)
-     • Web Vitals: LCP, FCP, FP, CLS, FID, INP, TTFB, long tasks, FPS
-     • Interactions: click, scroll depth, form submit + abandonment
-     • Errors: JS exceptions, unhandled rejections, asset failures
-     • Browser/device metadata on every record
-     • React + Angular auto-detection
-     • Class prototype auto-instrumentation
-     • Configurable sampling
-   Sends logs → /sentinel/ingest relay
+   SENTINEL SDK — Browser Agent v2
+   ─────────────────────────────────────────────────────────
+   ZERO-CONFIG: Drop this script and it auto-hooks everything.
+   No initSentinel() required. Just install + import.
+
+   New in v2:
+     • Zero-config auto-init via IIFE (no manual call needed)
+     • Per-user userId (persisted across sessions in localStorage)
+     • Per-tab sessionId (unique per browser tab/visit)
+     • Concurrent session tracking via BroadcastChannel heartbeat
+       → backend can answer "how many users right now?"
+     • Browser system metrics (CPU via scheduler, memory via
+       performance.memory, connection, battery — browser equiv
+       of psutil cpu/disk/memory since JS has no OS disk access)
+     • Improved trace propagation (traceId on every record)
    ============================================================ */
 
 import {
@@ -27,16 +30,65 @@ export interface SentinelBrowserConfig {
   flushInterval?:  number;
   slowFetchMs?:    number;
   debug?:          boolean;
-  traceId?:        string;
-  samplingRate?:   number;  // 0.0–1.0, default 1.0
+  samplingRate?:   number;   // 0.0–1.0, default 1.0
+  // userId resolution: if omitted, SDK auto-generates and persists one
+  resolveUserId?:  () => string | null | undefined;
+}
+
+/* ── ID helpers ──────────────────────────────────────────── */
+
+function genId(len = 16): string {
+  // crypto.randomUUID preferred, fallback to Math.random
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID().replace(/-/g, '').slice(0, len);
+  }
+  return Array.from({ length: len }, () =>
+    Math.floor(Math.random() * 16).toString(16)
+  ).join('');
+}
+
+/**
+ * Returns a stable userId persisted in localStorage.
+ * Survives page reloads; a new one is created only on first visit
+ * (or after localStorage is cleared).
+ */
+function resolveOrCreateUserId(): string {
+  const KEY = '__sentinel_uid';
+  try {
+    const existing = localStorage.getItem(KEY);
+    if (existing) return existing;
+    const uid = `u_${genId(20)}`;
+    localStorage.setItem(KEY, uid);
+    return uid;
+  } catch {
+    // localStorage blocked (private mode, iframe sandbox, etc.)
+    return `u_anon_${genId(12)}`;
+  }
+}
+
+/**
+ * Per-tab sessionId — lives only in sessionStorage so a new tab
+ * or fresh navigation gets a fresh session.
+ */
+function resolveOrCreateSessionId(): string {
+  const KEY = '__sentinel_sid';
+  try {
+    const existing = sessionStorage.getItem(KEY);
+    if (existing) return existing;
+    const sid = `s_${genId(20)}`;
+    sessionStorage.setItem(KEY, sid);
+    return sid;
+  } catch {
+    return `s_${genId(20)}`;
+  }
 }
 
 /* ── Device/browser helpers ──────────────────────────────── */
 
 function parseBrowser(ua: string): { browserName: string; browserVersion: string } {
   const pairs: Array<[RegExp, string]> = [
-    [/Edg\/([0-9.]+)/, 'Edge'], [/OPR\/([0-9.]+)/, 'Opera'],
-    [/Chrome\/([0-9.]+)/, 'Chrome'], [/Firefox\/([0-9.]+)/, 'Firefox'],
+    [/Edg\/([0-9.]+)/, 'Edge'],     [/OPR\/([0-9.]+)/, 'Opera'],
+    [/Chrome\/([0-9.]+)/, 'Chrome'],[/Firefox\/([0-9.]+)/, 'Firefox'],
     [/Safari\/([0-9.]+)/, 'Safari'],
   ];
   for (const [re, name] of pairs) {
@@ -47,46 +99,191 @@ function parseBrowser(ua: string): { browserName: string; browserVersion: string
 }
 
 function parseOS(ua: string): string {
-  if (/Windows/.test(ua)) return 'Windows';
-  if (/iPhone|iPad|iPod/.test(ua)) return 'iOS';
-  if (/Mac OS X/.test(ua)) return 'macOS';
-  if (/Android/.test(ua)) return 'Android';
-  if (/Linux/.test(ua)) return 'Linux';
+  if (/Windows/.test(ua))           return 'Windows';
+  if (/iPhone|iPad|iPod/.test(ua))  return 'iOS';
+  if (/Mac OS X/.test(ua))          return 'macOS';
+  if (/Android/.test(ua))           return 'Android';
+  if (/Linux/.test(ua))             return 'Linux';
   return 'unknown';
 }
 
 function parseDeviceType(ua: string): 'mobile' | 'tablet' | 'desktop' {
-  if (/Mobi/.test(ua)) return 'mobile';
-  if (/Tablet|iPad/.test(ua)) return 'tablet';
+  if (/Mobi/.test(ua))           return 'mobile';
+  if (/Tablet|iPad/.test(ua))    return 'tablet';
   return 'desktop';
 }
 
-function connectionType(): string {
-  return (navigator as any).connection?.effectiveType
-      || (navigator as any).connection?.type
-      || 'unknown';
+function connectionInfo(): Record<string, any> {
+  const conn = (navigator as any).connection || (navigator as any).mozConnection || (navigator as any).webkitConnection;
+  if (!conn) return { connectionType: 'unknown' };
+  return {
+    connectionType:       conn.effectiveType || conn.type || 'unknown',
+    connectionDownlinkMbps: conn.downlink,
+    connectionRttMs:      conn.rtt,
+    connectionSaveData:   conn.saveData,
+  };
+}
+
+/* ── Browser "psutil" equivalents ────────────────────────── */
+/*
+ * NOTE: The browser has NO access to disk or OS-level CPU the way
+ * psutil does. These are the correct browser counterparts:
+ *
+ *   psutil.cpu_percent()          → scheduler.yield timing heuristic
+ *   psutil.virtual_memory().total → performance.memory.jsHeapSizeLimit
+ *   psutil.virtual_memory().used  → performance.memory.usedJSHeapSize
+ *   psutil.disk_usage()           → StorageManager.estimate() [quota/usage]
+ *
+ * If you need true server-side OS metrics (CPU%, disk%) from your
+ * Python backend, emit them from your server-side Sentinel agent
+ * and correlate by traceId.
+ */
+
+async function collectBrowserSystemMetrics(): Promise<Record<string, any>> {
+  const metrics: Record<string, any> = {};
+
+  // ── JS Heap memory (closest to psutil virtual_memory) ──
+  const mem = (performance as any).memory;
+  if (mem) {
+    metrics.memoryUsedBytes  = mem.usedJSHeapSize;       // ~ psutil.virtual_memory().used
+    metrics.memoryTotalBytes = mem.jsHeapSizeLimit;       // ~ psutil.virtual_memory().total
+    metrics.memoryAllocated  = mem.totalJSHeapSize;
+    metrics.memoryUsedPercent = mem.jsHeapSizeLimit > 0
+      ? Math.round((mem.usedJSHeapSize / mem.jsHeapSizeLimit) * 100)
+      : undefined;
+  }
+
+  // ── Storage quota (closest to psutil disk_usage) ──
+  try {
+    if (navigator.storage?.estimate) {
+      const est = await navigator.storage.estimate();
+      metrics.diskUsedBytes       = est.usage;            // ~ psutil.disk_usage('/').used
+      metrics.diskQuotaBytes      = est.quota;            // ~ psutil.disk_usage('/').total
+      metrics.diskUsedPercent     = (est.quota && est.usage)
+        ? Math.round((est.usage / est.quota) * 100)       // ~ psutil.disk_usage('/').percent
+        : undefined;
+    }
+  } catch { /* storage API not available */ }
+
+  // ── CPU pressure heuristic via scheduler.yield timing ──
+  // True CPU% is not accessible from JS; this measures main-thread
+  // busyness which correlates with high CPU load.
+  try {
+    if ((navigator as any).scheduling?.isInputPending !== undefined) {
+      metrics.cpuInputPending = (navigator as any).scheduling.isInputPending();
+    }
+    const t0 = performance.now();
+    await new Promise<void>((res) => setTimeout(res, 0));
+    const yieldMs = performance.now() - t0;
+    // A healthy idle browser yields in <5ms; >50ms suggests CPU pressure
+    metrics.cpuYieldMs      = Math.round(yieldMs);
+    metrics.cpuPercent      = Math.min(100, Math.round((yieldMs / 100) * 100)); // heuristic, not real %
+  } catch { /* timing not available */ }
+
+  // ── Battery (bonus: no psutil equivalent in browser SDK) ──
+  try {
+    if ((navigator as any).getBattery) {
+      const batt = await (navigator as any).getBattery();
+      metrics.batteryLevel    = Math.round(batt.level * 100);
+      metrics.batteryCharging = batt.charging;
+    }
+  } catch { /* battery API not available or permission denied */ }
+
+  return metrics;
+}
+
+/* ── Concurrent session heartbeat ───────────────────────── */
+/*
+ * Uses BroadcastChannel so all open tabs of the same origin
+ * can see each other. Every tab announces itself every 5s.
+ * The backend receives session_heartbeat events and can count
+ * distinct sessionIds seen in the last ~10s = active sessions.
+ *
+ * This gives you: "X users are currently active" from your
+ * ingestion layer with a simple:
+ *   SELECT COUNT(DISTINCT sessionId)
+ *   FROM logs
+ *   WHERE eventType = 'session_heartbeat'
+ *     AND timestamp > NOW() - INTERVAL '10 seconds'
+ */
+
+class SessionRegistry {
+  private channel?: BroadcastChannel;
+  private activePeers = new Set<string>();
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
+
+  constructor(
+    private sessionId: string,
+    private userId: string,
+    private onHeartbeat: (peers: number) => void,
+  ) {}
+
+  start(): void {
+    try {
+      this.channel = new BroadcastChannel('__sentinel_sessions');
+      this.channel.onmessage = (e) => {
+        if (e.data?.type === 'heartbeat' && e.data.sessionId !== this.sessionId) {
+          this.activePeers.add(e.data.sessionId);
+          // Peer cleanup after 10s of no heartbeat
+          setTimeout(() => this.activePeers.delete(e.data.sessionId), 10_000);
+        }
+      };
+    } catch { /* BroadcastChannel not supported (Safari <15.4) */ }
+
+    this.heartbeatTimer = setInterval(() => {
+      this.channel?.postMessage({ type: 'heartbeat', sessionId: this.sessionId, userId: this.userId });
+      // +1 for self
+      this.onHeartbeat(this.activePeers.size + 1);
+    }, 5_000);
+
+    // Announce immediately
+    this.channel?.postMessage({ type: 'heartbeat', sessionId: this.sessionId, userId: this.userId });
+  }
+
+  stop(): void {
+    clearInterval(this.heartbeatTimer);
+    this.channel?.close();
+  }
+
+  /** Number of tabs currently known to be open (this tab + peers) */
+  get activeSessions(): number {
+    return this.activePeers.size + 1;
+  }
 }
 
 /* ── Main class ──────────────────────────────────────────── */
 
 export class SentinelBrowser {
-  private cfg:         Required<SentinelBrowserConfig>;
-  private queue:       LogRecord[] = [];
-  private flushTimer?: ReturnType<typeof setInterval>;
-  private navStart     = Date.now();
-  private instrumented = new WeakSet<object>();
-  private deviceMeta:  Record<string, any>;
+  private cfg:            Required<Omit<SentinelBrowserConfig, 'resolveUserId'>> & { resolveUserId?: () => string | null | undefined };
+  private queue:          LogRecord[] = [];
+  private flushTimer?:    ReturnType<typeof setInterval>;
+  private navStart        = Date.now();
+  private instrumented    = new WeakSet<object>();
+  private deviceMeta:     Record<string, any>;
+
+  // ── Identity ──────────────────────────────────────────────
+  readonly userId:    string;
+  readonly sessionId: string;
+  readonly traceId:   string;   // per-page-load trace
+
+  private sessionRegistry: SessionRegistry;
+  private activeSessions   = 1;
 
   constructor(config: SentinelBrowserConfig = {}) {
+    // Resolve identity FIRST so it's available on every emitted record
+    this.userId    = config.resolveUserId?.() || resolveOrCreateUserId();
+    this.sessionId = resolveOrCreateSessionId();
+    this.traceId   = genId(32);
+
     this.cfg = {
-      serviceName:   config.serviceName   || 'browser-app',
-      relayUrl:      config.relayUrl      || '/sentinel/ingest',
-      batchSize:     config.batchSize     || 20,
-      flushInterval: config.flushInterval || 3000,
-      slowFetchMs:   config.slowFetchMs   || 1000,
-      debug:         config.debug         || false,
-      traceId:       config.traceId       || this._genTraceId(),
+      serviceName:   config.serviceName   ?? 'browser-app',
+      relayUrl:      config.relayUrl      ?? '/sentinel/ingest',
+      batchSize:     config.batchSize     ?? 20,
+      flushInterval: config.flushInterval ?? 3000,
+      slowFetchMs:   config.slowFetchMs   ?? 1000,
+      debug:         config.debug         ?? false,
       samplingRate:  config.samplingRate  ?? 1.0,
+      resolveUserId: config.resolveUserId,
     };
 
     const ua = navigator.userAgent;
@@ -98,8 +295,29 @@ export class SentinelBrowser {
       screenHeight:   screen.height,
       viewportWidth:  window.innerWidth,
       viewportHeight: window.innerHeight,
-      connectionType: connectionType(),
+      locale:         navigator.language,
+      timezone:       Intl.DateTimeFormat().resolvedOptions().timeZone,
+      ...connectionInfo(),
     };
+
+    this.sessionRegistry = new SessionRegistry(
+      this.sessionId,
+      this.userId,
+      (peers) => {
+        this.activeSessions = peers;
+        // Emit heartbeat to relay — backend counts these for concurrency
+        this._emit({
+          message: `Session heartbeat (${peers} active tab${peers !== 1 ? 's' : ''})`,
+          layer:   LogLayer.OBSERVABILITY,
+          level:   LogLevel.DEBUG,
+          context: {
+            eventType:      'session_heartbeat',
+            activeSessions: peers,
+            page:           location.pathname,
+          } as LogContext,
+        });
+      },
+    );
   }
 
   /* ── Public API ─────────────────────────────────────────── */
@@ -114,13 +332,38 @@ export class SentinelBrowser {
     this._monitorFPS();
     this._startFlushLoop();
     this._detectFramework();
+    this.sessionRegistry.start();
 
+    // Emit session start with full identity context
     this._emit({
-      message: `Sentinel Browser Agent hooked on "${this.cfg.serviceName}"`,
+      message: `Session started — userId: ${this.userId} | sessionId: ${this.sessionId}`,
       layer:   LogLayer.INFRASTRUCTURE,
       level:   LogLevel.INFO,
-      context: { userAgent: navigator.userAgent, url: location.href, ...this.deviceMeta },
+      context: {
+        eventType: 'session_start',
+        url:       location.href,
+        referrer:  document.referrer,
+        ...this.deviceMeta,
+      } as LogContext,
     });
+
+    // Collect and emit browser system metrics immediately + every 30s
+    const emitSystemMetrics = async () => {
+      const sys = await collectBrowserSystemMetrics();
+      this._emit({
+        message: `System metrics — heap: ${sys.memoryUsedPercent ?? '?'}% | disk: ${sys.diskUsedPercent ?? '?'}% | cpu yield: ${sys.cpuYieldMs ?? '?'}ms`,
+        layer:   LogLayer.INFRASTRUCTURE,
+        level:   LogLevel.INFO,
+        context: {
+          eventType: 'system_metrics',
+          ...sys,
+          page: location.pathname,
+        } as LogContext,
+      });
+    };
+    void emitSystemMetrics();
+    setInterval(() => void emitSystemMetrics(), 30_000);
+
     return this;
   }
 
@@ -176,10 +419,19 @@ export class SentinelBrowser {
 
     const record = new LogRecord({
       ...partial,
-      service:  this.cfg.serviceName,
-      trace_id: partial.trace_id || this.cfg.traceId,
-      context:  {
+      service:    this.cfg.serviceName,
+      // Every record carries the full identity triple:
+      //   traceId   — per page-load, correlates all events on this navigation
+      //   sessionId — per browser tab, correlates all events in this visit
+      //   userId    — per human user, correlates across sessions/devices
+      trace_id:   partial.trace_id || this.traceId,
+      context: {
         ...(partial.context || {}),
+        // Identity fields on every single log record
+        userId:           this.userId,
+        sessionId:        this.sessionId,
+        traceId:          this.traceId,
+        activeSessions:   this.activeSessions,
         samplingRate:     this.cfg.samplingRate,
         samplingDecision: 'sampled',
       },
@@ -219,7 +471,10 @@ export class SentinelBrowser {
     window.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') void this._flush();
     });
-    window.addEventListener('beforeunload', () => void this._flush());
+    window.addEventListener('beforeunload', () => {
+      this.sessionRegistry.stop();
+      void this._flush();
+    });
   }
 
   /* ── Fetch patch ────────────────────────────────────────── */
@@ -252,19 +507,21 @@ export class SentinelBrowser {
         const durationMs = performance.now() - startTime;
         const isError    = !response.ok;
         const isSlow     = durationMs > self.cfg.slowFetchMs;
-        const rateLimitHit      = response.status === 429;
-        const rateLimitRemaining = Number(response.headers.get('X-RateLimit-Remaining') ?? response.headers.get('RateLimit-Remaining') ?? -1);
+        const rateLimitHit       = response.status === 429;
+        const rateLimitRemaining = Number(
+          response.headers.get('X-RateLimit-Remaining') ??
+          response.headers.get('RateLimit-Remaining') ?? -1
+        );
 
-        // Auth event detection
         if (AUTH_PATHS.test(url) || response.status === 401 || response.status === 403) {
           self._emit({
             message: `Auth event: ${method} ${url} → ${response.status}`,
             layer:   LogLayer.SECURITY,
             level:   response.status >= 400 ? LogLevel.WARN : LogLevel.INFO,
             context: {
-              authResult: response.status < 400 ? 'success' : 'failure',
-              path:       url,
-              statusCode: response.status,
+              authResult:    response.status < 400 ? 'success' : 'failure',
+              path:          url,
+              statusCode:    response.status,
               failureReason: response.status >= 400 ? `HTTP ${response.status}` : undefined,
               ...self.deviceMeta,
             } as LogContext,
@@ -277,13 +534,13 @@ export class SentinelBrowser {
           level:   isError ? LogLevel.ERROR : isSlow ? LogLevel.WARN : LogLevel.INFO,
           context: {
             method, path: url,
-            statusCode:        response.status,
+            statusCode:            response.status,
             durationMs,
-            slowQuery:         isSlow,
-            slowQueryThresholdMs: self.cfg.slowFetchMs,
+            slowQuery:             isSlow,
+            slowQueryThresholdMs:  self.cfg.slowFetchMs,
             rateLimitHit,
-            rateLimitRemaining: rateLimitRemaining >= 0 ? rateLimitRemaining : undefined,
-            responseSizeBytes:  Number(response.headers.get('content-length') || 0) || undefined,
+            rateLimitRemaining:    rateLimitRemaining >= 0 ? rateLimitRemaining : undefined,
+            responseSizeBytes:     Number(response.headers.get('content-length') || 0) || undefined,
           } as LogContext,
         });
 
@@ -324,7 +581,8 @@ export class SentinelBrowser {
         this._start = performance.now();
         self._emit({
           message: `XHR → ${this._method} ${this._url}`,
-          layer:   LogLayer.API_GATEWAY, level: LogLevel.INFO,
+          layer:   LogLayer.API_GATEWAY,
+          level:   LogLevel.INFO,
           context: {
             method: this._method, path: this._url,
             requestSizeBytes: typeof body === 'string' ? body.length : 0,
@@ -332,8 +590,8 @@ export class SentinelBrowser {
         });
 
         this.addEventListener('loadend', () => {
-          const durationMs        = performance.now() - this._start;
-          const rateLimitHit      = this.status === 429;
+          const durationMs         = performance.now() - this._start;
+          const rateLimitHit       = this.status === 429;
           const rateLimitRemaining = Number(this.getResponseHeader('X-RateLimit-Remaining') ?? -1);
           self._emit({
             message: `XHR ← ${this._method} ${this._url} ${this.status} (${durationMs.toFixed(1)}ms)${rateLimitHit ? ' [RATE-LIMITED]' : ''}`,
@@ -410,7 +668,6 @@ export class SentinelBrowser {
   private _hookInteractions(): void {
     const self = this;
 
-    // Clicks
     window.addEventListener('click', (e) => {
       const t = e.target as HTMLElement;
       self._emit({
@@ -427,7 +684,6 @@ export class SentinelBrowser {
       });
     }, { capture: true, passive: true });
 
-    // Scroll depth
     let maxScroll = 0;
     let scrollTimer: ReturnType<typeof setTimeout>;
     window.addEventListener('scroll', () => {
@@ -448,7 +704,6 @@ export class SentinelBrowser {
       }, 500);
     }, { passive: true });
 
-    // Form submit
     window.addEventListener('submit', (e) => {
       const t      = e.target as HTMLFormElement;
       const formId = t.id || t.getAttribute('name') || 'unknown-form';
@@ -470,14 +725,13 @@ export class SentinelBrowser {
       });
     }, { capture: true });
 
-    // Form abandonment
     const dirtyForms = new Map<string, { id: string; completed: number; total: number; lastField: string }>();
     window.addEventListener('input', (e) => {
       const el   = e.target as HTMLInputElement;
       const form = el.closest('form');
       if (!form) return;
-      const formId  = form.id || form.getAttribute('name') || 'unknown-form';
-      const fields  = Array.from(form.elements).filter((f: any) => f.name) as HTMLInputElement[];
+      const formId    = form.id || form.getAttribute('name') || 'unknown-form';
+      const fields    = Array.from(form.elements).filter((f: any) => f.name) as HTMLInputElement[];
       const completed = fields.filter((f) => f.value?.length > 0).length;
       dirtyForms.set(formId, { id: formId, completed, total: fields.length, lastField: el.name || el.id });
     }, { passive: true });
@@ -524,7 +778,6 @@ export class SentinelBrowser {
         });
         return;
       }
-
       self._emit({
         message: `JS Error: ${e.message}`,
         layer:   LogLayer.SECURITY,
@@ -559,7 +812,6 @@ export class SentinelBrowser {
     if (!('PerformanceObserver' in window)) return;
     const self = this;
 
-    // Named vital → context field
     const vitalField: Record<string, string> = {
       'first-contentful-paint':   'fcpMs',
       'first-paint':              'fpMs',
@@ -574,14 +826,13 @@ export class SentinelBrowser {
       try {
         const obs = new PerformanceObserver((list) => {
           list.getEntries().forEach((entry) => {
-            const value   = (entry as any).value ?? (entry as any).processingStart != null
+            const value  = (entry as any).value ?? (entry as any).processingStart != null
               ? ((entry as any).processingStart - entry.startTime)
               : (entry as any).duration ?? entry.startTime;
-            const isSlow  = type === 'longtask' || (type === 'largest-contentful-paint' && value > 2500);
-            const field   = vitalField[entry.name] || vitalField[type];
+            const isSlow = type === 'longtask' || (type === 'largest-contentful-paint' && value > 2500);
+            const field  = vitalField[entry.name] || vitalField[type];
             const extra: Record<string, any> = field ? { [field]: value } : {};
 
-            // TTFB from navigation timing
             if (type === 'navigation') {
               const nav = entry as PerformanceNavigationTiming;
               extra['ttfbMs'] = nav.responseStart - nav.requestStart;
@@ -601,7 +852,6 @@ export class SentinelBrowser {
               } as LogContext,
             });
 
-            // Resource failures
             if (type === 'resource') {
               const res = entry as PerformanceResourceTiming;
               if (res.responseStatus >= 400) {
@@ -631,8 +881,8 @@ export class SentinelBrowser {
       frames++;
       const now = performance.now();
       if (now - lastReport >= 5000) {
-        const fps = Math.round((frames / (now - lastReport)) * 1000);
-        frames    = 0;
+        const fps  = Math.round((frames / (now - lastReport)) * 1000);
+        frames     = 0;
         lastReport = now;
         if (fps < 30) {
           self._emit({
@@ -742,12 +992,6 @@ export class SentinelBrowser {
       } catch { /* some window props throw */ }
     });
   }
-
-  /* ── Helpers ─────────────────────────────────────────────── */
-
-  private _genTraceId(): string {
-    return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-  }
 }
 
 /* ── Factory ─────────────────────────────────────────────── */
@@ -757,3 +1001,84 @@ export const initBrowserSentinel = (config?: SentinelBrowserConfig): SentinelBro
   s.hook();
   return s;
 };
+
+/* ══════════════════════════════════════════════════════════════
+   ZERO-CONFIG AUTO-INIT
+   ══════════════════════════════════════════════════════════════
+   This IIFE runs the moment the module is first imported or the
+   script tag is parsed — before any application code runs.
+   The client app does NOT need to call initBrowserSentinel().
+
+   How it picks up config:
+     1. window.__SENTINEL_CONFIG__  (set before this script loads)
+     2. <script data-sentinel-service="my-app" ...>  (data attributes)
+     3. Safe defaults (service name = hostname)
+
+   To use:
+     Option A — pure auto (zero code in client):
+       <script src="/sentinel/sentinel-browser.js"></script>
+
+     Option B — config via window global (before script tag):
+       <script>
+         window.__SENTINEL_CONFIG__ = {
+           serviceName: 'my-enterprise-app',
+           samplingRate: 0.5,
+         };
+       </script>
+       <script src="/sentinel/sentinel-browser.js"></script>
+
+     Option C — config via data attributes on script tag:
+       <script
+         src="/sentinel/sentinel-browser.js"
+         data-sentinel-service="checkout-ui"
+         data-sentinel-relay="/api/sentinel/ingest"
+       ></script>
+
+     Option D — if bundled as ESM, simply import it:
+       import '@your-org/sentinel-browser';
+       // That's it. No initSentinel call needed.
+   ══════════════════════════════════════════════════════════════ */
+
+;(function autoInit() {
+  // Only run in a real browser context
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+  // Guard: don't double-init if imported multiple times
+  if ((window as any).__SENTINEL_INITIALIZED__) return;
+  (window as any).__SENTINEL_INITIALIZED__ = true;
+
+  // ── Config resolution priority ────────────────────────────
+
+  // 1. window.__SENTINEL_CONFIG__ (developer-set global)
+  const winCfg: SentinelBrowserConfig = (window as any).__SENTINEL_CONFIG__ || {};
+
+  // 2. data-* attributes on the <script> tag that loaded us
+  const scriptEl = (
+    document.currentScript ||
+    document.querySelector('script[src*="sentinel-browser"]')
+  ) as HTMLScriptElement | null;
+
+  const dataCfg: SentinelBrowserConfig = {};
+  if (scriptEl?.dataset) {
+    if (scriptEl.dataset.sentinelService)  dataCfg.serviceName   = scriptEl.dataset.sentinelService;
+    if (scriptEl.dataset.sentinelRelay)    dataCfg.relayUrl      = scriptEl.dataset.sentinelRelay;
+    if (scriptEl.dataset.sentinelSampling) dataCfg.samplingRate  = Number(scriptEl.dataset.sentinelSampling);
+    if (scriptEl.dataset.sentinelSlow)     dataCfg.slowFetchMs   = Number(scriptEl.dataset.sentinelSlow);
+    if (scriptEl.dataset.sentinelDebug)    dataCfg.debug         = scriptEl.dataset.sentinelDebug !== 'false';
+  }
+
+  // 3. Fallback defaults
+  const defaultCfg: SentinelBrowserConfig = {
+    serviceName: location.hostname || 'browser-app',
+  };
+
+  // Merge: data-attrs < window config < (hardcoded defaults for anything not set)
+  const finalCfg: SentinelBrowserConfig = { ...defaultCfg, ...dataCfg, ...winCfg };
+
+  // ── Init ──────────────────────────────────────────────────
+  const instance = new SentinelBrowser(finalCfg);
+  instance.hook();
+
+  // Expose on window so app code can call sentinel.log() if it wants
+  (window as any).__SENTINEL__ = instance;
+})();
