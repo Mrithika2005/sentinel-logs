@@ -3,32 +3,34 @@
   "version": "1.0.0",
   "description": "Cross-stack auto-hooking logging system",
   "type": "module",
+  "main": "./dist/core/types.js",
   "exports": {
-    ".":          "./sentinel-sdk/core/types.ts",
-    "./browser":  "./sentinel-sdk/browser/agent.ts",
-    "./node":     "./sentinel-sdk/node/agent.ts",
-    "./register": "./sentinel-sdk/node/register.ts"
+    ".":          "./dist/core/types.js",
+    "./browser":  "./dist/browser/agent.js",
+    "./node":     "./dist/node/agent.js",
+    "./register": "./dist/node/register.js"
   },
   "bin": {
     "sentinel-sdk": "./cli.js"
   },
   "scripts": {
-    "dev":   "tsx server.ts",
-    "build": "vite build",
-    "start": "tsx server.ts",
-    "lint":  "tsc --noEmit"
+    "dev":     "tsx server.ts",
+    "build":   "tsc -p tsconfig.sdk.json",
+    "prepare": "tsc -p tsconfig.sdk.json",
+    "start":   "tsx server.ts",
+    "lint":    "tsc --noEmit"
   },
   "dependencies": {
-    "@google/genai":       "^1.29.0",
-    "@tailwindcss/vite":  "^4.1.14",
-    "@vitejs/plugin-react":"^5.0.4",
-    "lucide-react":        "^0.546.0",
-    "react":               "^19.0.1",
-    "react-dom":           "^19.0.1",
-    "vite":                "^6.2.3",
-    "express":             "^4.21.2",
-    "dotenv":              "^17.2.3",
-    "motion":              "^12.23.24"
+    "@google/genai":        "^1.29.0",
+    "@tailwindcss/vite":   "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "lucide-react":         "^0.546.0",
+    "react":                "^19.0.1",
+    "react-dom":            "^19.0.1",
+    "vite":                 "^6.2.3",
+    "express":              "^4.21.2",
+    "dotenv":               "^17.2.3",
+    "motion":               "^12.23.24"
   },
   "devDependencies": {
     "@types/node":    "^22.14.0",
