@@ -6,7 +6,8 @@
   "exports": {
     ".": "./sentinel-sdk/core/types.ts",
     "./browser": "./sentinel-sdk/browser/agent.ts",
-    "./node": "./sentinel-sdk/node/agent.ts"
+    "./node": "./sentinel-sdk/node/agent.ts",
+    "./register": "./sentinel-sdk/node/register.ts"
   },
   "bin": {
     "sentinel-sdk": "./cli.js"
