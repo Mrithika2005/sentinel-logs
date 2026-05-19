@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sentinel-sdk-core"
+version = "1.0.0"
+description = "Cross-stack auto-hooking logging system"
+
+[tool.setuptools.package-dir]
+"" = "sentinel-sdk"
+
+[tool.setuptools.packages.find]
+where = ["sentinel-sdk"]
